@@ -1,0 +1,146 @@
+"""
+prepare-commit-msg hook: copy this branch's "PR #N" line into the new commit message
+"""
+
+import argparse
+import re
+import subprocess
+from collections.abc import Collection
+from pathlib import Path
+
+PR_LINE = re.compile(r"^PR #\d+\s*$", re.MULTILINE)
+DEFAULT_LONG_LIVED_BRANCHES = ("master", "main", "dev")
+VERBOSE_DIFF_MARKER = "# ------------------------ >8 ------------------------"
+SKIPPED_TITLE_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+
+
+def git_output(*args: str) -> str:
+    """
+    Run a git command and return its output
+
+    :param args: Arguments for git
+    :return: The stripped standard output, empty if the command failed
+    """
+    return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
+
+
+def ref_contains(ref: str, commit: str) -> bool:
+    """
+    Check whether a ref contains a commit
+
+    :param ref: The branch to look in
+    :param commit: The commit to look for
+    :return: True if ref exists and contains commit
+    """
+    args = ["git", "merge-base", "--is-ancestor", commit, ref]
+    return subprocess.run(args, capture_output=True).returncode == 0
+
+
+def merge_is_in_progress() -> bool:
+    """
+    Check whether the commit being made is a merge
+
+    :return: True if MERGE_HEAD exists
+    """
+    return bool(git_output("rev-parse", "-q", "--verify", "MERGE_HEAD"))
+
+
+def current_branch_is_long_lived(long_lived_branches: Collection[str]) -> bool:
+    """
+    Check whether the checked-out branch is one that PRs are merged into
+
+    :param long_lived_branches: Branches that PRs are merged into
+    :return: True if the checked-out branch is in long_lived_branches
+    """
+    return git_output("rev-parse", "--abbrev-ref", "HEAD") in long_lived_branches
+
+
+def merge_needs_no_pr_number(long_lived_branches: Collection[str]) -> bool:
+    """
+    Check whether the commit being made is a merge that needs no PR number
+
+    Only merging new commits into a long-lived branch needs one.
+
+    :param long_lived_branches: Branches that PRs are merged into
+    :return: True for a merge into a feature branch, or of commits a long-lived branch has
+    """
+    if not merge_is_in_progress():
+        return False
+    if not current_branch_is_long_lived(long_lived_branches):
+        return True
+    refs = [ref for branch in long_lived_branches for ref in (branch, f"origin/{branch}")]
+    return any(ref_contains(ref, "MERGE_HEAD") for ref in refs)
+
+
+def own_commit_messages(long_lived_branches: Collection[str]) -> str:
+    """
+    Get the messages of the commits that belong to the change being committed
+
+    These are the commits no remote branch has, except the branch's own pushed copy.
+    ``git checkout -b X origin/master`` makes origin/master the upstream, so the upstream only
+    counts as the pushed copy when it has the branch's name. ``--exclude`` needs the short
+    ``origin/<branch>`` form; git ignores ``refs/remotes/...`` there.
+
+    :param long_lived_branches: Branches that PRs are merged into
+    :return: The commit messages, newest first
+    """
+    log = ["log", "--format=%B", "--first-parent"]
+    if merge_is_in_progress():
+        if merge_needs_no_pr_number(long_lived_branches):
+            return ""
+        return git_output(*log, "MERGE_HEAD", "--not", "HEAD")
+    current_branch = git_output("rev-parse", "--abbrev-ref", "HEAD")
+    upstream = git_output("rev-parse", "--abbrev-ref", "@{upstream}")
+    upstream_is_pushed_branch = (
+        current_branch not in long_lived_branches and upstream.partition("/")[2] == current_branch
+    )
+    exclude = [f"--exclude={upstream}"] if upstream_is_pushed_branch else []
+    return git_output(*log, "HEAD", "--not", *exclude, "--remotes")
+
+
+def add_pr_number(message: str, own_messages: str) -> str:
+    """
+    Copy the newest "PR #N" line from own_messages into a message that has none
+
+    The line goes after the last non-comment line and above any ``git commit -v`` diff.
+
+    :param message: The commit message as git prepared it
+    :param own_messages: Messages of the commits that belong to this change
+    :return: The message, with the PR line added if it was missing
+    """
+    if message.startswith(SKIPPED_TITLE_PREFIXES) or PR_LINE.search(message):
+        return message
+    match = PR_LINE.search(own_messages)
+    if not match:
+        return message
+    pr_line = match[0].strip()
+    text, marker, diff = message.partition(VERBOSE_DIFF_MARKER)
+    lines = text.split("\n")
+    content = [i for i, line in enumerate(lines) if line.strip() and not line.startswith("#")]
+    if not content:
+        comments = text.lstrip("\n")
+        return f"\n\n{pr_line}\n{comments}{marker}{diff}"
+    end = content[-1] + 1
+    lines[end:end] = ["", pr_line]
+    return "\n".join(lines) + marker + diff
+
+
+def main() -> None:
+    """
+    Add the branch's PR line to the commit message file
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("message_file", type=Path)
+    parser.add_argument(
+        "--long-lived-branches",
+        type=lambda value: value.split(","),
+        default=DEFAULT_LONG_LIVED_BRANCHES,
+    )
+    args = parser.parse_args()
+    message = args.message_file.read_text()
+    own_messages = own_commit_messages(args.long_lived_branches)
+    args.message_file.write_text(add_pr_number(message, own_messages))
+
+
+if __name__ == "__main__":
+    main()

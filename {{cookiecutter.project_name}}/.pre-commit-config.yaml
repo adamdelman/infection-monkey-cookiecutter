@@ -1,3 +1,6 @@
+{% if cookiecutter.hook_gitlint -%}
+default_install_hook_types: [pre-commit, prepare-commit-msg, commit-msg]
+{% endif -%}
 default_stages: [pre-commit]
 default_language_version:
   python: python{{ cookiecutter.python_major_version }}.{{ cookiecutter.python_minor_version }}
@@ -27,6 +30,29 @@ repos:
     rev: v1.0.0
     hooks:
       - id: merge-issue-number
+{%- if cookiecutter.hook_gitlint %}
+  - repo: local
+    # long-lived-branches: branches PRs are merged into. Keep the list the same in both hooks.
+    hooks:
+      - id: gitlint
+        name: gitlint
+        language: python
+        additional_dependencies: [gitlint==0.19.1, pydocstyle==6.3.0]
+        entry: gitlint
+        args:
+          - -c
+          - body-requires-pr-number.long-lived-branches=master,main,dev
+          - --staged
+          - --msg-filename
+        stages: [commit-msg]
+      - id: add-pr-number
+        name: Add PR number
+        language: python
+        entry: python commit_hooks/add_pr_number.py
+        args:
+          - --long-lived-branches=master,main,dev
+        stages: [prepare-commit-msg]
+{%- endif %}
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v{{ cookiecutter._mypy_version }}
     hooks:

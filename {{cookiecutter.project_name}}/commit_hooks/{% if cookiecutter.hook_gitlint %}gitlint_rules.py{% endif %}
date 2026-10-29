@@ -1,0 +1,83 @@
+"""
+Custom gitlint rules, loaded through extra-path in .gitlint
+"""
+
+import re
+from collections.abc import Sequence
+
+from add_pr_number import DEFAULT_LONG_LIVED_BRANCHES, PR_LINE, merge_needs_no_pr_number
+from gitlint.git import GitCommit
+from gitlint.options import ListOption
+from gitlint.rules import CommitMessageTitle, CommitRule, LineRule, RuleViolation
+from pydocstyle.wordlists import IMPERATIVE_BLACKLIST, IMPERATIVE_VERBS, stem
+
+STEMMER_EXCEPTIONS = frozenset({"embed"})
+
+
+def word_is_imperative(word: str) -> bool:
+    """
+    Check whether a word is an imperative verb, e.g. "Add" and not "Added"
+
+    shortcut: words missing from pydocstyle's wordlist are judged by suffix; add misjudged
+    verbs to STEMMER_EXCEPTIONS.
+
+    :param word: The first word of the commit title after the Jira key
+    :return: True if the word is an imperative verb
+    """
+    word = word.lower()
+    if word in IMPERATIVE_BLACKLIST:
+        return False
+    if forms := IMPERATIVE_VERBS.get(stem(word)):
+        return word in forms
+    word_is_inflected = word.endswith(("ed", "ing", "s")) and stem(word) != word
+    return word in STEMMER_EXCEPTIONS or not word_is_inflected
+
+
+class TitleImperativeMood(LineRule):
+    """
+    UL1: Require the title's first word after the Jira key to be in the imperative mood
+    """
+
+    name = "title-imperative-mood"
+    id = "UL1"
+    target = CommitMessageTitle
+
+    def validate(self, line: str, _: GitCommit) -> Sequence[RuleViolation] | None:
+        """
+        Check the first word after all leading Jira keys
+
+        :param line: The commit title, e.g. "OCPSG-123: Add map writer"
+        :return: A violation if the word isn't imperative, else None
+        """
+        match = re.match(r"(?:[A-Z][A-Z0-9_]+-\d+: )+(\w+)", line)
+        if match and not word_is_imperative(match[1]):
+            message = f"Title must use the imperative mood (e.g. 'Add', not '{match[1]}')"
+            return [RuleViolation(self.id, message, line)]
+        return None
+
+
+class BodyRequiresPRNumber(CommitRule):
+    """
+    UC1: Require a "PR #N" line in the body, except in merges that need no PR number
+    """
+
+    name = "body-requires-pr-number"
+    id = "UC1"
+    options_spec = [
+        ListOption(
+            "long-lived-branches", list(DEFAULT_LONG_LIVED_BRANCHES), "Branches PRs are merged into"
+        )
+    ]
+
+    def validate(self, commit: GitCommit) -> Sequence[RuleViolation] | None:
+        """
+        Check the commit body for a "PR #N" line
+
+        :param commit: The commit being linted
+        :return: A violation if the line is missing and required, else None
+        """
+        if merge_needs_no_pr_number(self.options["long-lived-branches"].value):
+            return None
+        if not PR_LINE.search("\n".join(commit.message.body)):
+            return [RuleViolation(self.id, "Body must contain a 'PR #<number>' line")]
+        return None
